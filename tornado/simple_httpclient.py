@@ -142,7 +142,7 @@ class _HTTPConnection(object):
         self._timeout = None
         self._connect_timeout = None
         if self.request.headers.get('Connection') == 'close':
-            self.keep_alive = False 
+            self.keep_alive = False
         else:
             self.keep_alive = True
         with stack_context.StackContext(self.cleanup):
