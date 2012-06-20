@@ -195,7 +195,7 @@ class _HTTPConnection(object):
                                 self._on_connect(parsed)
                                 return
                 else:
-                    self.client.stream_map[self.stream_key]  = Queue.Queue()
+                    self.client.stream_map[self.stream_key] = Queue.Queue()
 
             addrinfo = socket.getaddrinfo(host, port, af, socket.SOCK_STREAM,
                                           0, 0)
