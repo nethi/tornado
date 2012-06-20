@@ -141,115 +141,120 @@ class _HTTPConnection(object):
         # Timeout handle returned by IOLoop.add_timeout
         self._timeout = None
         self._connect_timeout = None
-        if self.request.headers.get('Connection') == 'close':
-            self.keep_alive = False
-        else:
-            self.keep_alive = True
+        self.keep_alive = self.request.headers.get('Connection') != 'close'
+
         with stack_context.StackContext(self.cleanup):
-            parsed = urlparse.urlsplit(_unicode(self.request.url))
-            if ssl is None and parsed.scheme == "https":
+            urlparsed = urlparse.urlsplit(_unicode(self.request.url))
+            if ssl is None and urlparsed.scheme == "https":
                 raise ValueError("HTTPS requires either python2.6+ or "
                                  "curl_httpclient")
-            if parsed.scheme not in ("http", "https"):
+            if urlparsed.scheme not in ("http", "https"):
                 raise ValueError("Unsupported url scheme: %s" %
                                  self.request.url)
-            # urlsplit results have hostname and port results, but they
-            # didn't support ipv6 literals until python 2.7.
-            netloc = parsed.netloc
-            if "@" in netloc:
-                userpass, _, netloc = netloc.rpartition("@")
-            match = re.match(r'^(.+):(\d+)$', netloc)
-            if match:
-                host = match.group(1)
-                port = int(match.group(2))
+
+            self._init_with_stack_context(urlparsed, max_buffer_size)
+
+    def _init_with_stack_context(self, urlparsed, max_buffer_size):
+        # urlsplit results have hostname and port results, but they
+        # didn't support ipv6 literals until python 2.7.
+        netloc = urlparsed.netloc
+        if "@" in netloc:
+            userpass, _, netloc = netloc.rpartition("@")
+        match = re.match(r'^(.+):(\d+)$', netloc)
+        if match:
+            host = match.group(1)
+            port = int(match.group(2))
+        else:
+            host = netloc
+            port = 443 if urlparsed.scheme == "https" else 80
+        if re.match(r'^\[.*\]$', host):
+            # raw ipv6 addresses in urls are enclosed in brackets
+            host = host[1:-1]
+        parsed_hostname = host  # save final parsed host for _on_connect
+        if self.client.hostname_mapping is not None:
+            host = self.client.hostname_mapping.get(host, host)
+
+        if self.request.allow_ipv6:
+            af = socket.AF_UNSPEC
+        else:
+            # We only try the first IP we get from getaddrinfo,
+            # so restrict to ipv4 by default.
+            af = socket.AF_INET
+
+        # Ignore keep_alive logic if explicitly requesting non-presistent connections
+        stream_key = self.stream_key = (host, port, urlparsed.scheme)
+        if self.keep_alive:
+            current_stream = self.client.stream_map.get(stream_key, None)
+            if current_stream is not None:
+                while not current_stream.empty():
+                    self.stream = current_stream.get_nowait()
+                    # Ditch closed streams and get a new one
+                    if self.stream.closed():
+                        continue
+                    # Double check the stream isn't in use
+                    # Don't put back in the queue because if it's in use whoever's using it will,
+                    # or if it's closed it shouldn't be there
+                    if not (self.stream.reading() or self.stream.writing()):
+                        self.stream.set_close_callback(self._on_close)
+                        self._on_connect(urlparsed)
+                        return
             else:
-                host = netloc
-                port = 443 if parsed.scheme == "https" else 80
-            if re.match(r'^\[.*\]$', host):
-                # raw ipv6 addresses in urls are enclosed in brackets
-                host = host[1:-1]
-            parsed_hostname = host  # save final parsed host for _on_connect
-            if self.client.hostname_mapping is not None:
-                host = self.client.hostname_mapping.get(host, host)
+                self.client.stream_map[stream_key] = Queue.Queue()
 
-            if request.allow_ipv6:
-                af = socket.AF_UNSPEC
+        addrinfo = socket.getaddrinfo(host, port, af, socket.SOCK_STREAM, 0, 0)
+        af, socktype, proto, canonname, sockaddr = addrinfo[0]
+
+        request = self.request
+        if urlparsed.scheme == "https":
+            ssl_options = {}
+            if request.validate_cert:
+                ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
+            if request.ca_certs is not None:
+                ssl_options["ca_certs"] = request.ca_certs
             else:
-                # We only try the first IP we get from getaddrinfo,
-                # so restrict to ipv4 by default.
-                af = socket.AF_INET
-            # Ignore keep_alive logic if explicitly requesting non-presistent connections
-            if self.keep_alive:
-                self.stream_key = (host, port, parsed.scheme)
-                if self.client.stream_map.has_key(self.stream_key):
-                    while not self.client.stream_map[self.stream_key].empty():
-                        self.stream = self.client.stream_map[self.stream_key].get_nowait()
-                        # Ditch closed streams and get a new one
-                        if self.stream.closed():
-                            continue
-                        # Double check the stream isn't in use
-                        # Don't put back in the queue because if it's in use whoever's using it will,
-                        # or if it's closed it shouldn't be there
-                        if not (self.stream.reading() or self.stream.writing()):
-                                self.stream.set_close_callback(self._on_close)
-                                self._on_connect(parsed)
-                                return
-                else:
-                    self.client.stream_map[self.stream_key] = Queue.Queue()
+                ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
+            if request.client_key is not None:
+                ssl_options["keyfile"] = request.client_key
+            if request.client_cert is not None:
+                ssl_options["certfile"] = request.client_cert
 
-            addrinfo = socket.getaddrinfo(host, port, af, socket.SOCK_STREAM,
-                                          0, 0)
-            af, socktype, proto, canonname, sockaddr = addrinfo[0]
-
-            if parsed.scheme == "https":
-                ssl_options = {}
-                if request.validate_cert:
-                    ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
-                if request.ca_certs is not None:
-                    ssl_options["ca_certs"] = request.ca_certs
-                else:
-                    ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
-                if request.client_key is not None:
-                    ssl_options["keyfile"] = request.client_key
-                if request.client_cert is not None:
-                    ssl_options["certfile"] = request.client_cert
-
-                # SSL interoperability is tricky.  We want to disable
-                # SSLv2 for security reasons; it wasn't disabled by default
-                # until openssl 1.0.  The best way to do this is to use
-                # the SSL_OP_NO_SSLv2, but that wasn't exposed to python
-                # until 3.2.  Python 2.7 adds the ciphers argument, which
-                # can also be used to disable SSLv2.  As a last resort
-                # on python 2.6, we set ssl_version to SSLv3.  This is
-                # more narrow than we'd like since it also breaks
-                # compatibility with servers configured for TLSv1 only,
-                # but nearly all servers support SSLv3:
-                # http://blog.ivanristic.com/2011/09/ssl-survey-protocol-support.html
-                if sys.version_info >= (2, 7):
-                    ssl_options["ciphers"] = "DEFAULT:!SSLv2"
-                else:
-                    # This is really only necessary for pre-1.0 versions
-                    # of openssl, but python 2.6 doesn't expose version
-                    # information.
-                    ssl_options["ssl_version"] = ssl.PROTOCOL_SSLv3
-
-                self.stream = SSLIOStream(socket.socket(af, socktype, proto),
-                                          io_loop=self.io_loop,
-                                          ssl_options=ssl_options,
-                                          max_buffer_size=max_buffer_size)
+            # SSL interoperability is tricky.  We want to disable
+            # SSLv2 for security reasons; it wasn't disabled by default
+            # until openssl 1.0.  The best way to do this is to use
+            # the SSL_OP_NO_SSLv2, but that wasn't exposed to python
+            # until 3.2.  Python 2.7 adds the ciphers argument, which
+            # can also be used to disable SSLv2.  As a last resort
+            # on python 2.6, we set ssl_version to SSLv3.  This is
+            # more narrow than we'd like since it also breaks
+            # compatibility with servers configured for TLSv1 only,
+            # but nearly all servers support SSLv3:
+            # http://blog.ivanristic.com/2011/09/ssl-survey-protocol-support.html
+            if sys.version_info >= (2, 7):
+                ssl_options["ciphers"] = "DEFAULT:!SSLv2"
             else:
-                self.stream = IOStream(socket.socket(af, socktype, proto),
-                                       io_loop=self.io_loop,
-                                       max_buffer_size=max_buffer_size)
-            timeout = min(request.connect_timeout, request.request_timeout)
-            if timeout:
-                self._timeout = self.io_loop.add_timeout(
-                    self.start_time + timeout,
-                    stack_context.wrap(self._on_timeout))
-            self.stream.set_close_callback(self._on_close)
-            self.stream.connect(sockaddr,
-                                functools.partial(self._on_connect, parsed,
-                                                  parsed_hostname))
+                # This is really only necessary for pre-1.0 versions
+                # of openssl, but python 2.6 doesn't expose version
+                # information.
+                ssl_options["ssl_version"] = ssl.PROTOCOL_SSLv3
+
+            self.stream = SSLIOStream(socket.socket(af, socktype, proto),
+                                      io_loop=self.io_loop,
+                                      ssl_options=ssl_options,
+                                      max_buffer_size=max_buffer_size)
+        else:
+            self.stream = IOStream(socket.socket(af, socktype, proto),
+                                   io_loop=self.io_loop,
+                                   max_buffer_size=max_buffer_size)
+
+        timeout = min(request.connect_timeout, request.request_timeout)
+        if timeout:
+            self._timeout = self.io_loop.add_timeout(
+                self.start_time + timeout,
+                stack_context.wrap(self._on_timeout))
+        self.stream.set_close_callback(self._on_close)
+        self.stream.connect(sockaddr,
+                            functools.partial(self._on_connect, urlparsed,
+                                              parsed_hostname))
 
     def _on_timeout(self):
         self._timeout = None
