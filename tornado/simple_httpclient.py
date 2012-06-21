@@ -141,7 +141,15 @@ class _HTTPConnection(object):
         # Timeout handle returned by IOLoop.add_timeout
         self._timeout = None
         self._connect_timeout = None
-        self.keep_alive = self.request.headers.get('Connection') != 'close'
+
+        # Acccording to section 8.1.2.1 in RFC 2616 - which covers HTTP/1.1
+        # - all connections should per default be treated as persistent unless
+        # explicitly defined otherwise by either the client or server.
+        # This is achieved by setting the connection-token to close in the
+        # Connection request header. Thus, if the connection-token is not set
+        # to close we should treat the connection as persistent.
+        self.keep_alive = request.headers.get('Connection') != 'close'
+        self.keep_alive_agreement = self.keep_alive
 
         with stack_context.StackContext(self.cleanup):
             urlparsed = urlparse.urlsplit(_unicode(self.request.url))
@@ -152,9 +160,9 @@ class _HTTPConnection(object):
                 raise ValueError("Unsupported url scheme: %s" %
                                  self.request.url)
 
-            self._init_with_stack_context(urlparsed, max_buffer_size)
+            self._init_stream(urlparsed, max_buffer_size)
 
-    def _init_with_stack_context(self, urlparsed, max_buffer_size):
+    def _init_stream(self, urlparsed, max_buffer_size):
         # urlsplit results have hostname and port results, but they
         # didn't support ipv6 literals until python 2.7.
         netloc = urlparsed.netloc
@@ -174,32 +182,36 @@ class _HTTPConnection(object):
         if self.client.hostname_mapping is not None:
             host = self.client.hostname_mapping.get(host, host)
 
+        self.stream_key = (host, port, urlparsed.scheme)
+        if self.keep_alive:
+            # Since we are intended to utilize persistent connections we
+            # can avoid initializing new IOStreams and reuse an existing one
+            # setup for the specified host, port and scheme.
+            current_queue = self._get_promised_stream_queue()
+
+            while not current_queue.empty():
+                stream = self.stream = current_queue.get_nowait()
+                # Ditch closed streams in queue and ensure we'll initialize
+                # a new stream queue for this connection.
+                if stream.closed():
+                    current_queue.task_done()
+                    continue
+
+                # In case the existing stream is not doing I/O we can
+                # utilize it. We should not put back in the queue since
+                # the process using it is in charge of doing that along
+                # with closing it.
+                if not (stream.reading() or stream.writing()):
+                    stream.set_close_callback(self._on_close)
+                    self._on_connect(urlparsed)
+                    return
+
         if self.request.allow_ipv6:
             af = socket.AF_UNSPEC
         else:
             # We only try the first IP we get from getaddrinfo,
             # so restrict to ipv4 by default.
             af = socket.AF_INET
-
-        # Ignore keep_alive logic if explicitly requesting non-presistent connections
-        stream_key = self.stream_key = (host, port, urlparsed.scheme)
-        if self.keep_alive:
-            current_stream = self.client.stream_map.get(stream_key, None)
-            if current_stream is not None:
-                while not current_stream.empty():
-                    self.stream = current_stream.get_nowait()
-                    # Ditch closed streams and get a new one
-                    if self.stream.closed():
-                        continue
-                    # Double check the stream isn't in use
-                    # Don't put back in the queue because if it's in use whoever's using it will,
-                    # or if it's closed it shouldn't be there
-                    if not (self.stream.reading() or self.stream.writing()):
-                        self.stream.set_close_callback(self._on_close)
-                        self._on_connect(urlparsed)
-                        return
-            else:
-                self.client.stream_map[stream_key] = Queue.Queue()
 
         addrinfo = socket.getaddrinfo(host, port, af, socket.SOCK_STREAM, 0, 0)
         af, socktype, proto, canonname, sockaddr = addrinfo[0]
@@ -255,6 +267,17 @@ class _HTTPConnection(object):
         self.stream.connect(sockaddr,
                             functools.partial(self._on_connect, urlparsed,
                                               parsed_hostname))
+
+    def _get_promised_stream_queue(self):
+        """Retrieve the Queue instance associated with the current
+        stream key. In case none exists this method will ensure to
+        initialize it automatically in order to guarantee the return
+        of a Queue instance.
+        """
+        mapping = self.client.stream_map
+        if self.stream_key not in mapping:
+            mapping[self.stream_key] = Queue.Queue()
+        return mapping[self.stream_key]
 
     def _on_timeout(self):
         self._timeout = None
@@ -357,7 +380,33 @@ class _HTTPConnection(object):
                                 request_time=time.time() - self.start_time,
                                 ))
             if hasattr(self, "stream"):
-                self.stream.close()
+                self._close_stream()
+
+    def _close_stream(self):
+        """Safely close the current connection stream.
+
+        In case the intention is to persist the connection on both the
+        client- & serverside then we avoid closing the stream entirely.
+
+        However, if this is not the case we close the stream directly.
+        We also ensure to garbage collect the entire stream queue in case
+        the client expected a persistent connection, but was denied such
+        a connection by the server.
+        """
+        if self.keep_alive_agreement:
+            return
+
+        stream_queue = self.client.stream_map.get(self.stream_key, None)
+        if stream_queue is None:
+            self.stream.close()
+            return
+
+        while not stream_queue.empty():
+            stream = stream_queue.get_nowait()
+            if not stream.closed():
+                stream.close()
+            stream_queue.task_done()
+        del self.client.stream_map[self.stream_key]
 
     def _on_close(self):
         if self.final_callback is not None:
@@ -385,10 +434,9 @@ class _HTTPConnection(object):
         else:
             content_length = None
 
-        if self.headers.get('Connection') == 'keep-alive':
-            self.keep_alive = True
-        elif self.headers.get('Connection') == 'close':
-            self.keep_alive = False
+        expected_keep_alive = self.keep_alive
+        self.keep_alive = self.headers.get('Connection') != 'close'
+        self.keep_alive_agreement = self.keep_alive and expected_keep_alive
 
         if self.request.header_callback is not None:
             for k, v in self.headers.get_all():
@@ -421,9 +469,12 @@ class _HTTPConnection(object):
             self.stream.read_until_close(self._on_body)
 
     def _on_body(self, data):
-        if self.keep_alive:
+        if self.keep_alive_agreement:
+            # Neither the client nor the server explicitly set the
+            # connection-token to close, therefore we should treat
+            # the connection as persistent according to the RFC.
             self.stream._close_callback = None
-            self.client.stream_map[self.stream_key].put_nowait(self.stream)
+            self._get_promised_stream_queue().put_nowait(self.stream)
         if self._timeout is not None:
             self.io_loop.remove_timeout(self._timeout)
             self._timeout = None
@@ -453,7 +504,7 @@ class _HTTPConnection(object):
             self.final_callback = None
             self._release()
             self.client.fetch(new_request, final_callback)
-            self.stream.close()
+            self._close_stream()
             return
         if self._decompressor:
             data = (self._decompressor.decompress(data) +
@@ -472,8 +523,7 @@ class _HTTPConnection(object):
                                 buffer=buffer,
                                 effective_url=self.request.url)
         self._run_callback(response)
-        if not self.keep_alive:
-            self.stream.close()
+        self._close_stream()
 
     def _on_chunk_length(self, data):
         # TODO: "chunk extensions" http://tools.ietf.org/html/rfc2616#section-3.6.1

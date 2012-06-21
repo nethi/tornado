@@ -88,7 +88,9 @@ class ProcessTest(LogTrapTestCase):
 
                 def fetch(url, fail_ok=False):
                     try:
-                        return client.fetch(get_url(url))
+                        return client.fetch(get_url(url), headers={
+                            'Connection': 'close'
+                        })
                     except HTTPError, e:
                         if not (fail_ok and e.code == 599):
                             raise
