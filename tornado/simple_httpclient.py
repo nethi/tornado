@@ -15,6 +15,7 @@ import copy
 import functools
 import logging
 import os.path
+import Queue
 import re
 import socket
 import sys
@@ -87,6 +88,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         self.active = {}
         self.hostname_mapping = hostname_mapping
         self.max_buffer_size = max_buffer_size
+        self.stream_map = {}
 
     def fetch(self, request, callback, **kwargs):
         if not isinstance(request, HTTPRequest):
@@ -136,93 +138,144 @@ class _HTTPConnection(object):
         self._decompressor = None
         # Timeout handle returned by IOLoop.add_timeout
         self._timeout = None
+        self._connect_timeout = None
+
+        # Acccording to section 8.1.2.1 in RFC 2616 - which covers HTTP/1.1
+        # - all connections should per default be treated as persistent unless
+        # explicitly defined otherwise by either the client or server.
+        # This is achieved by setting the connection-token to close in the
+        # Connection request header. Thus, if the connection-token is not set
+        # to close we should treat the connection as persistent.
+        self.keep_alive = request.headers.get('Connection') != 'close'
+        self.keep_alive_agreement = self.keep_alive
+
         with stack_context.StackContext(self.cleanup):
-            parsed = urlparse.urlsplit(_unicode(self.request.url))
-            if ssl is None and parsed.scheme == "https":
+            urlparsed = urlparse.urlsplit(_unicode(self.request.url))
+            if ssl is None and urlparsed.scheme == "https":
                 raise ValueError("HTTPS requires either python2.6+ or "
                                  "curl_httpclient")
-            if parsed.scheme not in ("http", "https"):
+            if urlparsed.scheme not in ("http", "https"):
                 raise ValueError("Unsupported url scheme: %s" %
                                  self.request.url)
-            # urlsplit results have hostname and port results, but they
-            # didn't support ipv6 literals until python 2.7.
-            netloc = parsed.netloc
-            if "@" in netloc:
-                userpass, _, netloc = netloc.rpartition("@")
-            match = re.match(r'^(.+):(\d+)$', netloc)
-            if match:
-                host = match.group(1)
-                port = int(match.group(2))
+
+            self._init_stream(urlparsed, max_buffer_size)
+
+    def _init_stream(self, urlparsed, max_buffer_size):
+        # urlsplit results have hostname and port results, but they
+        # didn't support ipv6 literals until python 2.7.
+        netloc = urlparsed.netloc
+        if "@" in netloc:
+            userpass, _, netloc = netloc.rpartition("@")
+        match = re.match(r'^(.+):(\d+)$', netloc)
+        if match:
+            host = match.group(1)
+            port = int(match.group(2))
+        else:
+            host = netloc
+            port = 443 if urlparsed.scheme == "https" else 80
+        if re.match(r'^\[.*\]$', host):
+            # raw ipv6 addresses in urls are enclosed in brackets
+            host = host[1:-1]
+        parsed_hostname = host  # save final parsed host for _on_connect
+        if self.client.hostname_mapping is not None:
+            host = self.client.hostname_mapping.get(host, host)
+
+        self.stream_key = (host, port, urlparsed.scheme)
+        if self.keep_alive:
+            # Since we are intended to utilize persistent connections we
+            # can avoid initializing new IOStreams and reuse an existing one
+            # setup for the specified host, port and scheme.
+            current_queue = self._get_promised_stream_queue()
+
+            while not current_queue.empty():
+                stream = self.stream = current_queue.get_nowait()
+                # Ditch closed streams in queue and ensure we'll initialize
+                # a new stream queue for this connection.
+                if stream.closed():
+                    current_queue.task_done()
+                    continue
+
+                # In case the existing stream is not doing I/O we can
+                # utilize it. We should not put back in the queue since
+                # the process using it is in charge of doing that along
+                # with closing it.
+                if not (stream.reading() or stream.writing()):
+                    stream.set_close_callback(self._on_close)
+                    self._on_connect(urlparsed)
+                    return
+
+        if self.request.allow_ipv6:
+            af = socket.AF_UNSPEC
+        else:
+            # We only try the first IP we get from getaddrinfo,
+            # so restrict to ipv4 by default.
+            af = socket.AF_INET
+
+        addrinfo = socket.getaddrinfo(host, port, af, socket.SOCK_STREAM, 0, 0)
+        af, socktype, proto, canonname, sockaddr = addrinfo[0]
+
+        request = self.request
+        if urlparsed.scheme == "https":
+            ssl_options = {}
+            if request.validate_cert:
+                ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
+            if request.ca_certs is not None:
+                ssl_options["ca_certs"] = request.ca_certs
             else:
-                host = netloc
-                port = 443 if parsed.scheme == "https" else 80
-            if re.match(r'^\[.*\]$', host):
-                # raw ipv6 addresses in urls are enclosed in brackets
-                host = host[1:-1]
-            parsed_hostname = host  # save final parsed host for _on_connect
-            if self.client.hostname_mapping is not None:
-                host = self.client.hostname_mapping.get(host, host)
+                ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
+            if request.client_key is not None:
+                ssl_options["keyfile"] = request.client_key
+            if request.client_cert is not None:
+                ssl_options["certfile"] = request.client_cert
 
-            if request.allow_ipv6:
-                af = socket.AF_UNSPEC
+            # SSL interoperability is tricky.  We want to disable
+            # SSLv2 for security reasons; it wasn't disabled by default
+            # until openssl 1.0.  The best way to do this is to use
+            # the SSL_OP_NO_SSLv2, but that wasn't exposed to python
+            # until 3.2.  Python 2.7 adds the ciphers argument, which
+            # can also be used to disable SSLv2.  As a last resort
+            # on python 2.6, we set ssl_version to SSLv3.  This is
+            # more narrow than we'd like since it also breaks
+            # compatibility with servers configured for TLSv1 only,
+            # but nearly all servers support SSLv3:
+            # http://blog.ivanristic.com/2011/09/ssl-survey-protocol-support.html
+            if sys.version_info >= (2, 7):
+                ssl_options["ciphers"] = "DEFAULT:!SSLv2"
             else:
-                # We only try the first IP we get from getaddrinfo,
-                # so restrict to ipv4 by default.
-                af = socket.AF_INET
+                # This is really only necessary for pre-1.0 versions
+                # of openssl, but python 2.6 doesn't expose version
+                # information.
+                ssl_options["ssl_version"] = ssl.PROTOCOL_SSLv3
 
-            addrinfo = socket.getaddrinfo(host, port, af, socket.SOCK_STREAM,
-                                          0, 0)
-            af, socktype, proto, canonname, sockaddr = addrinfo[0]
+            self.stream = SSLIOStream(socket.socket(af, socktype, proto),
+                                      io_loop=self.io_loop,
+                                      ssl_options=ssl_options,
+                                      max_buffer_size=max_buffer_size)
+        else:
+            self.stream = IOStream(socket.socket(af, socktype, proto),
+                                   io_loop=self.io_loop,
+                                   max_buffer_size=max_buffer_size)
 
-            if parsed.scheme == "https":
-                ssl_options = {}
-                if request.validate_cert:
-                    ssl_options["cert_reqs"] = ssl.CERT_REQUIRED
-                if request.ca_certs is not None:
-                    ssl_options["ca_certs"] = request.ca_certs
-                else:
-                    ssl_options["ca_certs"] = _DEFAULT_CA_CERTS
-                if request.client_key is not None:
-                    ssl_options["keyfile"] = request.client_key
-                if request.client_cert is not None:
-                    ssl_options["certfile"] = request.client_cert
+        timeout = min(request.connect_timeout, request.request_timeout)
+        if timeout:
+            self._timeout = self.io_loop.add_timeout(
+                self.start_time + timeout,
+                stack_context.wrap(self._on_timeout))
+        self.stream.set_close_callback(self._on_close)
+        self.stream.connect(sockaddr,
+                            functools.partial(self._on_connect, urlparsed,
+                                              parsed_hostname))
 
-                # SSL interoperability is tricky.  We want to disable
-                # SSLv2 for security reasons; it wasn't disabled by default
-                # until openssl 1.0.  The best way to do this is to use
-                # the SSL_OP_NO_SSLv2, but that wasn't exposed to python
-                # until 3.2.  Python 2.7 adds the ciphers argument, which
-                # can also be used to disable SSLv2.  As a last resort
-                # on python 2.6, we set ssl_version to SSLv3.  This is
-                # more narrow than we'd like since it also breaks
-                # compatibility with servers configured for TLSv1 only,
-                # but nearly all servers support SSLv3:
-                # http://blog.ivanristic.com/2011/09/ssl-survey-protocol-support.html
-                if sys.version_info >= (2, 7):
-                    ssl_options["ciphers"] = "DEFAULT:!SSLv2"
-                else:
-                    # This is really only necessary for pre-1.0 versions
-                    # of openssl, but python 2.6 doesn't expose version
-                    # information.
-                    ssl_options["ssl_version"] = ssl.PROTOCOL_SSLv3
-
-                self.stream = SSLIOStream(socket.socket(af, socktype, proto),
-                                          io_loop=self.io_loop,
-                                          ssl_options=ssl_options,
-                                          max_buffer_size=max_buffer_size)
-            else:
-                self.stream = IOStream(socket.socket(af, socktype, proto),
-                                       io_loop=self.io_loop,
-                                       max_buffer_size=max_buffer_size)
-            timeout = min(request.connect_timeout, request.request_timeout)
-            if timeout:
-                self._timeout = self.io_loop.add_timeout(
-                    self.start_time + timeout,
-                    stack_context.wrap(self._on_timeout))
-            self.stream.set_close_callback(self._on_close)
-            self.stream.connect(sockaddr,
-                                functools.partial(self._on_connect, parsed,
-                                                  parsed_hostname))
+    def _get_promised_stream_queue(self):
+        """Retrieve the Queue instance associated with the current
+        stream key. In case none exists this method will ensure to
+        initialize it automatically in order to guarantee the return
+        of a Queue instance.
+        """
+        mapping = self.client.stream_map
+        if self.stream_key not in mapping:
+            mapping[self.stream_key] = Queue.Queue()
+        return mapping[self.stream_key]
 
     def _on_timeout(self):
         self._timeout = None
@@ -230,6 +283,9 @@ class _HTTPConnection(object):
             raise HTTPError(599, "Timeout")
 
     def _on_connect(self, parsed, parsed_hostname):
+        if self._connect_timeout is not None:
+            self.io_loop.remove_timeout(self._connect_timeout)
+            self._connect_timeout = None
         if self._timeout is not None:
             self.io_loop.remove_timeout(self._timeout)
             self._timeout = None
@@ -322,7 +378,33 @@ class _HTTPConnection(object):
                                 request_time=time.time() - self.start_time,
                                 ))
             if hasattr(self, "stream"):
-                self.stream.close()
+                self._close_stream()
+
+    def _close_stream(self):
+        """Safely close the current connection stream.
+
+        In case the intention is to persist the connection on both the
+        client- & serverside then we avoid closing the stream entirely.
+
+        However, if this is not the case we close the stream directly.
+        We also ensure to garbage collect the entire stream queue in case
+        the client expected a persistent connection, but was denied such
+        a connection by the server.
+        """
+        if self.keep_alive_agreement:
+            return
+
+        stream_queue = self.client.stream_map.get(self.stream_key, None)
+        if stream_queue is None:
+            self.stream.close()
+            return
+
+        while not stream_queue.empty():
+            stream = stream_queue.get_nowait()
+            if not stream.closed():
+                stream.close()
+            stream_queue.task_done()
+        del self.client.stream_map[self.stream_key]
 
     def _on_close(self):
         if self.final_callback is not None:
@@ -359,6 +441,10 @@ class _HTTPConnection(object):
         else:
             content_length = None
 
+        expected_keep_alive = self.keep_alive
+        self.keep_alive = self.headers.get('Connection') != 'close'
+        self.keep_alive_agreement = self.keep_alive and expected_keep_alive
+
         if self.request.header_callback is not None:
             for k, v in self.headers.get_all():
                 self.request.header_callback("%s: %s\r\n" % (k, v))
@@ -390,6 +476,12 @@ class _HTTPConnection(object):
             self.stream.read_until_close(self._on_body)
 
     def _on_body(self, data):
+        if self.keep_alive_agreement:
+            # Neither the client nor the server explicitly set the
+            # connection-token to close, therefore we should treat
+            # the connection as persistent according to the RFC.
+            self.stream._close_callback = None
+            self._get_promised_stream_queue().put_nowait(self.stream)
         if self._timeout is not None:
             self.io_loop.remove_timeout(self._timeout)
             self._timeout = None
@@ -419,7 +511,7 @@ class _HTTPConnection(object):
             self.final_callback = None
             self._release()
             self.client.fetch(new_request, final_callback)
-            self.stream.close()
+            self._close_stream()
             return
         if self._decompressor:
             data = (self._decompressor.decompress(data) +
@@ -438,7 +530,7 @@ class _HTTPConnection(object):
                                 buffer=buffer,
                                 effective_url=self.request.url)
         self._run_callback(response)
-        self.stream.close()
+        self._close_stream()
 
     def _on_chunk_length(self, data):
         # TODO: "chunk extensions" http://tools.ietf.org/html/rfc2616#section-3.6.1
